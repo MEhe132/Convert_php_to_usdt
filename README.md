@@ -27,8 +27,8 @@ A floating, transparent overlay widget built in Python with Tkinter. It was crea
 #### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/<your-username>/calc-php-converter.git
-   cd calc-php-converter
+   git clone https://github.com/MEhe132/Convert_php_to_usdt.git
+   cd Convert_php_to_usdt
    ```
 
 2. Install dependencies:
