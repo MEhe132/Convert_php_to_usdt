@@ -148,7 +148,8 @@ def process_query(text):
 def extract_numbers_from_clipboard(text):
     if not text:
         return ""
-    numbers = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+    # Way 3: Matches any sequence of digits (including decimals) anywhere in the text
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
     if not numbers:
         return ""
     return ", ".join(numbers)
@@ -717,7 +718,6 @@ class FloatingCalcOverlay:
         cur_bg = self.table_rows_frame.cget("bg")
 
         if not query:
-            self.lbl_summary.config(text="")
             # Placeholder row
             row = tk.Frame(self.table_rows_frame, bg=cur_bg)
             row.pack(fill="x", pady=2)
@@ -730,7 +730,6 @@ class FloatingCalcOverlay:
 
         results = process_query(query)
         if not results:
-            self.lbl_summary.config(text="")
             row = tk.Frame(self.table_rows_frame, bg=cur_bg)
             row.pack(fill="x", pady=2)
             lbl1 = tk.Label(row, text=query, font=("Segoe UI", 9, "bold"), bg=cur_bg, fg="#ff4444", anchor="w")
