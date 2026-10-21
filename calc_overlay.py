@@ -15,20 +15,24 @@ from PIL import Image, ImageGrab
 
 # Configuration file to remember screen position, size, and opacity
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_config.json")
+NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.txt")
 
 # 1 PHP = 0.01589488 USDT
 PHP_TO_USDT = 0.01589488
 
 # Windows Hotkey constants
+MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_NOREPEAT = 0x4000
+VK_SPACE = 0x20
 VK_OEM_2 = 0xBF  # '?' and '/' key
 VK_OEM_PLUS = 0xBB  # '+' / '=' key
 VK_OEM_MINUS = 0xBD  # '-' / '_' key
 VK_ADD = 0x6B  # Numpad '+'
 VK_SUBTRACT = 0x6D  # Numpad '-'
 
-HOTKEY_ID_FOCUS = 101
+HOTKEY_ID_TOGGLE = 100
+HOTKEY_ID_LENS = 101
 HOTKEY_ID_OP_PLUS1 = 102
 HOTKEY_ID_OP_PLUS2 = 103
 HOTKEY_ID_OP_MINUS1 = 104
@@ -69,11 +73,12 @@ def convert_single_token(token):
     if not token:
         return None
 
-    # Check for explicit USDT/USD: "10 usdt", "2.5 usd"
-    m_usdt = re.match(r"^([\d\.]+)\s*(?:usdt|usd)$", token, re.I)
+    # Check for explicit USDT/USD or $ sign (e.g. "12$", "$12", "10 usdt", "2.5 usd")
+    m_usdt = re.match(r"^(?:(?:\$?\s*([\d\.]+)\s*(?:usdt|usd|\$))|(?:\$\s*([\d\.]+)))$", token, re.I)
     if m_usdt:
         try:
-            val = float(m_usdt.group(1))
+            val_str = m_usdt.group(1) or m_usdt.group(2)
+            val = float(val_str)
             php_val = val / PHP_TO_USDT
             return {
                 "input": f"{val:g} USDT",
@@ -275,6 +280,14 @@ class FloatingCalcOverlay:
         self.last_clipboard_text = ""
         self._is_destroyed = False
 
+        # Auto-minimize and Minimized State (Chat head / Pill)
+        self.is_minimized = False
+        self._inactivity_timer_id = None
+        self._mouse_inside_window = False
+        self._pre_minimize_geometry = None
+        self._bubble_drag_started = False
+        self._bubble_press_pos = (0, 0)
+
         # Color key for true transparency in Windows
         self.transparent_key = "#010101"
         try:
@@ -323,6 +336,7 @@ class FloatingCalcOverlay:
         self._start_w = self.fixed_width
         self._start_h = start_h
         self.root.geometry(f"{self.fixed_width}x{start_h}+{start_x}+{start_y}")
+        self._check_notepad_visibility()
 
         # Apply saved opacity setting
         if self.opacity != 1.0:
@@ -336,7 +350,8 @@ class FloatingCalcOverlay:
 
         # Local window hotkeys
         self.root.bind("<Escape>", lambda e: self.on_close())
-        self.root.bind("<Control-slash>", lambda e: self.focus_input())
+        self.root.bind("<Control-slash>", lambda e: self.start_lens_sniper())
+        self.root.bind("<Alt-space>", lambda e: self.toggle_open_minimize())
 
         # Shortcuts for Opacity: Ctrl + and Ctrl - (supporting main keyboard, numpad, and Shift)
         self.root.bind("<Control-plus>", lambda e: self.adjust_opacity(0.1))
@@ -345,12 +360,26 @@ class FloatingCalcOverlay:
         self.root.bind("<Control-minus>", lambda e: self.adjust_opacity(-0.1))
         self.root.bind("<Control-KP_Subtract>", lambda e: self.adjust_opacity(-0.1))
 
+        # Activity tracking for 5-second auto-minimize timer
+        self.root.bind_all("<Key>", self._on_user_interaction, add="+")
+        self.root.bind_all("<Motion>", self._on_user_interaction, add="+")
+        self.root.bind_all("<Button-1>", self._on_user_interaction, add="+")
+        self.root.bind_all("<Button-2>", self._on_user_interaction, add="+")
+        self.root.bind_all("<Button-3>", self._on_user_interaction, add="+")
+
+        # Track mouse entering/leaving the window
+        self.root.bind("<Enter>", self._on_window_enter)
+        self.root.bind("<Leave>", self._on_window_leave)
+
         # Global hotkey listener (Ctrl + /, Ctrl + Plus, Ctrl + Minus) in background daemon thread
         self._hotkey_thread = threading.Thread(target=self._listen_global_hotkey, daemon=True)
         self._hotkey_thread.start()
 
         # Start Tkinter-native clipboard watcher
         self.root.after(500, self._poll_clipboard)
+
+        # Start auto-minimize timer loop
+        self.reset_inactivity_timer()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -399,20 +428,53 @@ class FloatingCalcOverlay:
         btn_op_minus.pack(side="left", padx=1)
         btn_op_minus.bind("<Button-1>", lambda e: self.adjust_opacity(-0.1))
 
-        # Close button in upper right corner
+        # Close button in the far upper-right corner
         close_btn = tk.Label(
             self.header,
-            text="✕ ",
+            text=" ✕ ",
             bg="#11111b",
             fg="#ff3333",
             font=("Segoe UI", 9, "bold"),
             cursor="hand2"
         )
-        close_btn.pack(side="right", padx=2)
+        close_btn.pack(side="right", padx=(0, 2))
         close_btn.bind("<Button-1>", lambda e: self.on_close())
 
+        # Minimize button '-' right before the close button
+        min_btn = tk.Label(
+            self.header,
+            text=" - ",
+            bg="#11111b",
+            fg="#89b4fa",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2"
+        )
+        min_btn.pack(side="right", padx=(0, 1))
+        min_btn.bind("<Button-1>", lambda e: self.minimize_to_bubble())
+
+        # Container frame for full calculator UI (allows swapping with bubble)
+        self.main_content_frame = tk.Frame(self.root, bg="#000000")
+        self.main_content_frame.pack(fill="both", expand=True)
+
+        # Bubble / Minimized Frame (hidden by default)
+        self.bubble_frame = tk.Frame(self.root, bg=self.transparent_key)
+        self.bubble_canvas = tk.Canvas(
+            self.bubble_frame,
+            width=38,
+            height=38,
+            bg=self.transparent_key,
+            highlightthickness=0
+        )
+        self.bubble_canvas.pack(fill="both", expand=True)
+
+        self.bubble_canvas.bind("<ButtonPress-1>", self._on_bubble_press)
+        self.bubble_canvas.bind("<B1-Motion>", self._on_bubble_motion)
+        self.bubble_canvas.bind("<ButtonRelease-1>", self._on_bubble_release)
+        self.bubble_canvas.bind("<Enter>", self._on_bubble_enter)
+        self.bubble_canvas.bind("<Leave>", self._on_bubble_leave)
+
         # Bottom Bar (Lens button + ON/OFF toggle + Toast + Resize Grip)
-        self.bottom_bar = tk.Frame(self.root, bg="#11111b", height=22)
+        self.bottom_bar = tk.Frame(self.main_content_frame, bg="#11111b", height=22)
         self.bottom_bar.pack(fill="x", side="bottom")
 
         # Google Lens Button in Bottom Bar with high-contrast Border
@@ -480,13 +542,17 @@ class FloatingCalcOverlay:
         self.grip.bind("<Leave>", lambda e: self.grip.config(fg="#ff5555", bg="#11111b"))
 
         # Calculator Container (tight compact padding)
-        self.calc_panel = tk.Frame(self.root, bg="#181825", padx=4, pady=2)
+        self.calc_panel = tk.Frame(self.main_content_frame, bg="#181825", padx=4, pady=2)
         self.calc_panel.pack(fill="both", expand=True)
+
+        # Left Column: Calculator (Input + Results Table)
+        self.calc_left_col = tk.Frame(self.calc_panel, bg="#181825")
+        self.calc_left_col.pack(side="left", fill="both", expand=False)
 
         # Input box
         self.entry_var = tk.StringVar()
         self.entry = tk.Entry(
-            self.calc_panel,
+            self.calc_left_col,
             textvariable=self.entry_var,
             font=("Segoe UI", 10, "bold"),
             bg="#252538",
@@ -501,7 +567,7 @@ class FloatingCalcOverlay:
         self.entry.bind("<KeyRelease>", self.on_input_change)
 
         # Results display area (table view & summary)
-        self.results_frame = tk.Frame(self.calc_panel, bg="#181825")
+        self.results_frame = tk.Frame(self.calc_left_col, bg="#181825")
         self.results_frame.pack(fill="both", expand=True)
 
         # Header for the 2 columns (PHP➔USDT)
@@ -539,6 +605,72 @@ class FloatingCalcOverlay:
         self.table_rows_frame = tk.Frame(self.results_frame, bg="#181825")
         self.table_rows_frame.pack(fill="x", expand=True)
 
+        # Right Column: Notepad Panel (Hidden by default, packed only when window is dragged wider)
+        self.notepad_panel = tk.Frame(self.calc_panel, bg="#1e1e2e", padx=3, pady=2)
+
+        # Notepad header label
+        self.notepad_header = tk.Frame(self.notepad_panel, bg="#1e1e2e")
+        self.notepad_header.pack(fill="x", pady=(0, 2))
+        self.notepad_lbl = tk.Label(
+            self.notepad_header,
+            text="📝 Notes",
+            font=("Segoe UI", 8, "bold"),
+            bg="#1e1e2e",
+            fg="#fab387"
+        )
+        self.notepad_lbl.pack(side="left")
+
+        # Notepad Text widget with wrap & auto-save (height=1 so it never inflates window reqheight)
+        self.notepad_text = tk.Text(
+            self.notepad_panel,
+            font=("Consolas", 9),
+            bg="#181825",
+            fg="#cdd6f4",
+            insertbackground="#fab387",
+            relief="flat",
+            bd=1,
+            wrap="word",
+            width=16,
+            height=1
+        )
+        self.notepad_text.pack(fill="both", expand=True)
+        self.notepad_text.bind("<KeyRelease>", self._on_note_change)
+        self._load_notes()
+
+    def _check_notepad_visibility(self):
+        """Shows notepad only when window width has been expanded beyond default compact calculator width."""
+        try:
+            cur_w = self.root.winfo_width()
+            # If width expanded by more than 40px over compact min_width, reveal notepad
+            if cur_w > (self.min_width + 40):
+                if not self.notepad_panel.winfo_ismapped():
+                    self.notepad_panel.pack(side="left", fill="both", expand=True, padx=(4, 0))
+            else:
+                if self.notepad_panel.winfo_ismapped():
+                    self.notepad_panel.pack_forget()
+        except Exception:
+            pass
+
+    def _load_notes(self):
+        """Loads saved notes from notes.txt if it exists."""
+        try:
+            if os.path.exists(NOTES_FILE):
+                with open(NOTES_FILE, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    self.notepad_text.delete("1.0", tk.END)
+                    self.notepad_text.insert("1.0", content)
+        except Exception:
+            pass
+
+    def _on_note_change(self, event=None):
+        """Auto-saves notes to notes.txt on keystroke."""
+        try:
+            content = self.notepad_text.get("1.0", tk.END)
+            with open(NOTES_FILE, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
     def _blend_color(self, hex_fg, hex_bg, factor):
         """Blends a hex color toward background to simulate background opacity."""
         c1 = [int(hex_fg[i:i+2], 16) for i in (1, 3, 5)]
@@ -571,6 +703,13 @@ class FloatingCalcOverlay:
             self.header.configure(bg=bg_bar)
             self.bottom_bar.configure(bg=bg_bar)
             self.calc_panel.configure(bg=bg_main)
+            if hasattr(self, "calc_left_col"):
+                self.calc_left_col.configure(bg=bg_main)
+            if hasattr(self, "notepad_panel"):
+                self.notepad_panel.configure(bg=bg_entry)
+                self.notepad_header.configure(bg=bg_entry)
+                self.notepad_lbl.configure(bg=bg_entry)
+                self.notepad_text.configure(bg=bg_bar)
             self.results_frame.configure(bg=bg_main)
             self.table_header.configure(bg=bg_main)
             self.table_rows_frame.configure(bg=bg_main)
@@ -847,12 +986,15 @@ class FloatingCalcOverlay:
 
     def focus_input(self, event=None):
         try:
+            if self.is_minimized:
+                self.restore_from_bubble()
             self.root.deiconify()
             self.root.lift()
             self.root.attributes("-topmost", True)
             self.entry.focus_force()
             self.entry.selection_range(0, tk.END)
             self.entry.icursor(tk.END)
+            self.reset_inactivity_timer()
         except Exception:
             pass
 
@@ -885,11 +1027,18 @@ class FloatingCalcOverlay:
         self._is_destroyed = True
         self.clipboard_watch_active = False
 
+        if self._inactivity_timer_id is not None:
+            try:
+                self.root.after_cancel(self._inactivity_timer_id)
+            except Exception:
+                pass
+            self._inactivity_timer_id = None
+
         # Persist position to disk so it re-opens in the exact same location
         self._save_window_config()
 
         user32 = ctypes.windll.user32
-        for hid in [HOTKEY_ID_FOCUS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
+        for hid in [HOTKEY_ID_TOGGLE, HOTKEY_ID_LENS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
             try:
                 user32.UnregisterHotKey(None, hid)
             except Exception:
@@ -912,9 +1061,18 @@ class FloatingCalcOverlay:
                     if clean_text:
                         extracted = extract_numbers_from_clipboard(clean_text)
                         if extracted:
+                            # Automatically restore and show calculator if currently minimized
+                            if self.is_minimized:
+                                self.restore_from_bubble()
+                            else:
+                                self.root.deiconify()
+                                self.root.lift()
+                                self.root.attributes("-topmost", True)
+
                             self.entry_var.set(extracted)
                             self.on_input_change()
                             self.flash_toast("📋 Auto-converted from copy!")
+                            self.reset_inactivity_timer()
             except Exception:
                 pass
 
@@ -924,15 +1082,18 @@ class FloatingCalcOverlay:
     def _listen_global_hotkey(self):
         user32 = ctypes.windll.user32
 
-        def safe_reg(hid, vk):
-            if not user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_NOREPEAT, vk):
-                user32.RegisterHotKey(None, hid, MOD_CONTROL, vk)
+        def safe_reg(hid, mod, vk):
+            if not user32.RegisterHotKey(None, hid, mod | MOD_NOREPEAT, vk):
+                user32.RegisterHotKey(None, hid, mod, vk)
 
-        safe_reg(HOTKEY_ID_FOCUS, VK_OEM_2)
-        safe_reg(HOTKEY_ID_OP_PLUS1, VK_OEM_PLUS)
-        safe_reg(HOTKEY_ID_OP_PLUS2, VK_ADD)
-        safe_reg(HOTKEY_ID_OP_MINUS1, VK_OEM_MINUS)
-        safe_reg(HOTKEY_ID_OP_MINUS2, VK_SUBTRACT)
+        # Alt + Space to toggle open / minimize
+        safe_reg(HOTKEY_ID_TOGGLE, MOD_ALT, VK_SPACE)
+        # Ctrl + / for Google Lens sniper
+        safe_reg(HOTKEY_ID_LENS, MOD_CONTROL, VK_OEM_2)
+        safe_reg(HOTKEY_ID_OP_PLUS1, MOD_CONTROL, VK_OEM_PLUS)
+        safe_reg(HOTKEY_ID_OP_PLUS2, MOD_CONTROL, VK_ADD)
+        safe_reg(HOTKEY_ID_OP_MINUS1, MOD_CONTROL, VK_OEM_MINUS)
+        safe_reg(HOTKEY_ID_OP_MINUS2, MOD_CONTROL, VK_SUBTRACT)
 
         msg = wintypes.MSG()
         WM_HOTKEY = 0x0312
@@ -940,9 +1101,14 @@ class FloatingCalcOverlay:
         while not self._is_destroyed and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             if msg.message == WM_HOTKEY:
                 hid = msg.wParam
-                if hid == HOTKEY_ID_FOCUS:
+                if hid == HOTKEY_ID_TOGGLE:
                     try:
-                        self.root.after(0, self.focus_input)
+                        self.root.after(0, self.toggle_open_minimize)
+                    except Exception:
+                        break
+                elif hid == HOTKEY_ID_LENS:
+                    try:
+                        self.root.after(0, self.start_lens_sniper)
                     except Exception:
                         break
                 elif hid in (HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2):
@@ -959,7 +1125,7 @@ class FloatingCalcOverlay:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-        for hid in [HOTKEY_ID_FOCUS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
+        for hid in [HOTKEY_ID_TOGGLE, HOTKEY_ID_LENS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
             try:
                 user32.UnregisterHotKey(None, hid)
             except Exception:
@@ -989,6 +1155,277 @@ class FloatingCalcOverlay:
         cur_x = self.root.winfo_x()
         cur_y = self.root.winfo_y()
         self.root.geometry(f"{new_w}x{new_h}+{cur_x}+{cur_y}")
+        self._check_notepad_visibility()
+
+    # --- Auto-Minimize and Floating Chat Head / Pill System ---
+    def _on_user_interaction(self, event=None):
+        """Called whenever the user interacts (typing, moving mouse inside, clicking, dragging)."""
+        if not self.is_minimized:
+            self.reset_inactivity_timer()
+
+    def _on_window_enter(self, event=None):
+        self._mouse_inside_window = True
+        if self._inactivity_timer_id is not None:
+            self.root.after_cancel(self._inactivity_timer_id)
+            self._inactivity_timer_id = None
+
+    def _on_window_leave(self, event=None):
+        # Check if cursor is truly outside the root window coordinates
+        try:
+            px = self.root.winfo_pointerx()
+            py = self.root.winfo_pointery()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+
+            if not (rx <= px <= rx + rw and ry <= py <= ry + rh):
+                self._mouse_inside_window = False
+                if not self.is_minimized:
+                    self.reset_inactivity_timer()
+        except Exception:
+            self._mouse_inside_window = False
+            if not self.is_minimized:
+                self.reset_inactivity_timer()
+
+    def reset_inactivity_timer(self):
+        """Resets the 5-second inactivity countdown timer."""
+        if self._inactivity_timer_id is not None:
+            try:
+                self.root.after_cancel(self._inactivity_timer_id)
+            except Exception:
+                pass
+            self._inactivity_timer_id = None
+
+        if not self._is_destroyed and not self.is_minimized:
+            # 5000 ms = 5 seconds
+            self._inactivity_timer_id = self.root.after(5000, self._check_auto_minimize)
+
+    def _check_auto_minimize(self):
+        self._inactivity_timer_id = None
+        if self._is_destroyed or self.is_minimized:
+            return
+
+        # Double check if mouse pointer is currently inside our window
+        try:
+            px = self.root.winfo_pointerx()
+            py = self.root.winfo_pointery()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                # Mouse is still inside window, defer minimize
+                self.reset_inactivity_timer()
+                return
+        except Exception:
+            pass
+
+        self.minimize_to_bubble()
+
+    def toggle_open_minimize(self):
+        """Alt + Space toggle: opens/restores if minimized, minimizes to edge if open."""
+        if self._is_destroyed:
+            return
+        if self.is_minimized:
+            self.restore_from_bubble()
+        else:
+            self.minimize_to_bubble()
+
+    def minimize_to_bubble(self):
+        """Smoothly collapses the full calculator and auto-snaps to left or right screen edge as a tab/pill."""
+        if self.is_minimized or self._is_destroyed:
+            return
+
+        # Save previous window position and size for instant, exact restore
+        self._pre_minimize_geometry = {
+            "x": self.root.winfo_x(),
+            "y": self.root.winfo_y(),
+            "w": self.root.winfo_width(),
+            "h": self.root.winfo_height(),
+            "bg": self.root.cget("bg")
+        }
+
+        self.is_minimized = True
+        if self._inactivity_timer_id is not None:
+            self.root.after_cancel(self._inactivity_timer_id)
+            self._inactivity_timer_id = None
+
+        # Hide main calculator content and header
+        self.header.pack_forget()
+        self.main_content_frame.pack_forget()
+
+        # Configure root for transparent bubble backdrop
+        self.root.configure(bg=self.transparent_key)
+        self.bubble_frame.pack(fill="both", expand=True)
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        cur_x = self._pre_minimize_geometry["x"]
+        cur_y = self._pre_minimize_geometry["y"]
+
+        # Auto-snap to nearest edge (left or right side edge)
+        # Closer to left half -> snap to left edge (x = 0) with '>' tab
+        # Closer to right half -> snap to right edge (x = screen_w - 38) with '<' tab
+        if (cur_x + 19) < (screen_w // 2):
+            bx = 0
+        else:
+            bx = screen_w - 38
+
+        # Keep vertical position within screen bounds
+        by = max(10, min(screen_h - 48, cur_y))
+
+        self.root.geometry(f"38x38+{bx}+{by}")
+        self._draw_bubble(is_hover=False)
+
+    def restore_from_bubble(self):
+        """Expands the floating bubble back to the full calculator instantly right at that location."""
+        if not self.is_minimized or self._is_destroyed:
+            return
+
+        self.is_minimized = False
+
+        # Hide bubble frame
+        self.bubble_frame.pack_forget()
+
+        # Re-pack header and main content
+        self.header.pack(fill="x", side="top")
+        self.main_content_frame.pack(fill="both", expand=True)
+
+        # Restore original background color and geometry
+        saved = self._pre_minimize_geometry or {}
+        w = saved.get("w", self.fixed_width)
+        h = saved.get("h", self.min_height)
+
+        cur_bx = self.root.winfo_x()
+        cur_by = self.root.winfo_y()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        # If bubble was snapped against right edge, expand inward to left
+        if cur_bx + w > screen_w:
+            target_x = max(0, screen_w - w - 10)
+        else:
+            target_x = max(0, cur_bx)
+
+        if cur_by + h > screen_h:
+            target_y = max(0, screen_h - h - 10)
+        else:
+            target_y = max(0, cur_by)
+
+        self.root.geometry(f"{w}x{h}+{target_x}+{target_y}")
+
+        # Reapply current opacity styling
+        self.adjust_opacity(0.0)
+
+        # Focus calculator input
+        self.root.after(50, lambda: self.entry.focus_set())
+        self.reset_inactivity_timer()
+
+    def _draw_bubble(self, is_hover=False):
+        """
+        Draws the sleek Messenger-style chat head or edge drawer tab:
+        - If against left edge (x <= 40px): displays '>' drawer tab
+        - If against right edge (x >= screen_width - 70px): displays '<' drawer tab
+        - Otherwise (floating anywhere on screen): displays sleek circular chat head with '₱' / '$' or icon
+        """
+        self.bubble_canvas.delete("all")
+
+        cur_x = self.root.winfo_x()
+        screen_w = self.root.winfo_screenwidth()
+
+        # Edge detection
+        is_left_edge = cur_x <= 30
+        is_right_edge = cur_x >= (screen_w - 68)
+
+        # Color scheme
+        bg_color = "#313244" if is_hover else "#181825"
+        border_color = "#89b4fa" if is_hover else "#cdd6f4"
+        text_color = "#00ff88" if is_hover else "#89b4fa"
+
+        if is_left_edge:
+            # Left edge pill tab: show '>'
+            symbol = ">"
+            self.bubble_canvas.create_oval(
+                -10, 2, 34, 36,
+                fill=bg_color,
+                outline=border_color,
+                width=2
+            )
+            self.bubble_canvas.create_text(
+                17, 19,
+                text=symbol,
+                fill=text_color,
+                font=("Segoe UI", 12, "bold")
+            )
+        elif is_right_edge:
+            # Right edge pill tab: show '<'
+            symbol = "<"
+            self.bubble_canvas.create_oval(
+                4, 2, 48, 36,
+                fill=bg_color,
+                outline=border_color,
+                width=2
+            )
+            self.bubble_canvas.create_text(
+                21, 19,
+                text=symbol,
+                fill=text_color,
+                font=("Segoe UI", 12, "bold")
+            )
+        else:
+            # Floating Chat Head Circle (38x38)
+            self.bubble_canvas.create_oval(
+                2, 2, 36, 36,
+                fill=bg_color,
+                outline=border_color,
+                width=2
+            )
+            # Inner accent ring
+            self.bubble_canvas.create_oval(
+                5, 5, 33, 33,
+                outline="#45475a",
+                width=1
+            )
+            self.bubble_canvas.create_text(
+                19, 19,
+                text="₱",
+                fill="#ff5555" if not is_hover else "#00ff88",
+                font=("Segoe UI", 12, "bold")
+            )
+
+    def _on_bubble_enter(self, event):
+        self._draw_bubble(is_hover=True)
+
+    def _on_bubble_leave(self, event):
+        self._draw_bubble(is_hover=False)
+
+    def _on_bubble_press(self, event):
+        self._bubble_drag_started = False
+        self._bubble_press_pos = (event.x_root, event.y_root)
+        self._offsetx = event.x
+        self._offsety = event.y
+
+    def _on_bubble_motion(self, event):
+        dx = abs(event.x_root - self._bubble_press_pos[0])
+        dy = abs(event.y_root - self._bubble_press_pos[1])
+        if dx > 3 or dy > 3:
+            self._bubble_drag_started = True
+
+        new_x = self.root.winfo_pointerx() - self._offsetx
+        new_y = self.root.winfo_pointery() - self._offsety
+        self.root.geometry(f"+{new_x}+{new_y}")
+        self._draw_bubble(is_hover=True)
+
+    def _on_bubble_release(self, event):
+        if not self._bubble_drag_started:
+            # Single click -> instantly restore full calculator right at this position!
+            self.restore_from_bubble()
+        else:
+            self._draw_bubble(is_hover=False)
+
 
 
 if __name__ == "__main__":
