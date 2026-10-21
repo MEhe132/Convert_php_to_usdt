@@ -3,7 +3,6 @@ import re
 import threading
 import ctypes
 from ctypes import wintypes
-import urllib.parse
 import webbrowser
 import io
 import os
@@ -11,7 +10,7 @@ import tempfile
 import base64
 import subprocess
 import json
-from PIL import Image, ImageGrab
+from PIL import ImageGrab
 
 # Configuration file to remember screen position, size, and opacity
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_config.json")
@@ -19,6 +18,13 @@ NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.txt
 
 # 1 PHP = 0.01589488 USDT
 PHP_TO_USDT = 0.01589488
+
+# Pre-compiled regular expressions for high-frequency conversion & clipboard parsing
+RE_USDT = re.compile(r"^(?:(?:\$?\s*([\d\.]+)\s*(?:usdt|usd|\$))|(?:\$\s*([\d\.]+)))$", re.I)
+RE_PHP_NUM = re.compile(r"^([\d\.]+)\s*(?:php)?$", re.I)
+RE_CLEAN_MATH = re.compile(r"[^0-9\+\-\*\/\.\(\)\%\s]")
+RE_SPLIT_TOKENS = re.compile(r"[,;]+")
+RE_NUMBERS = re.compile(r"\d+(?:\.\d+)?")
 
 # Windows Hotkey constants
 MOD_ALT = 0x0001
@@ -50,7 +56,7 @@ except Exception:
 
 def eval_math(expr):
     """Safely evaluates basic arithmetic expressions (+, -, *, /, %, parenthesis)."""
-    clean_expr = re.sub(r"[^0-9\+\-\*\/\.\(\)\%\s]", "", expr)
+    clean_expr = RE_CLEAN_MATH.sub("", expr)
     if not clean_expr:
         return None
     try:
@@ -74,7 +80,7 @@ def convert_single_token(token):
         return None
 
     # Check for explicit USDT/USD or $ sign (e.g. "12$", "$12", "10 usdt", "2.5 usd")
-    m_usdt = re.match(r"^(?:(?:\$?\s*([\d\.]+)\s*(?:usdt|usd|\$))|(?:\$\s*([\d\.]+)))$", token, re.I)
+    m_usdt = RE_USDT.match(token)
     if m_usdt:
         try:
             val_str = m_usdt.group(1) or m_usdt.group(2)
@@ -92,7 +98,7 @@ def convert_single_token(token):
             pass
 
     # Check for math operators (+, -, *, /, %, (, ))
-    has_operator = any(op in token for op in ["+", "-", "*", "/", "%", "(", ")"])
+    has_operator = any(op in token for op in ("+", "-", "*", "/", "%", "(", ")"))
     if has_operator:
         val = eval_math(token)
         if val is not None:
@@ -108,7 +114,7 @@ def convert_single_token(token):
         return {"input": token, "output": "Math error", "display": f"{token}: Error", "out_val": "", "php_num": 0.0, "usdt_num": 0.0}
 
     # Check for direct number or number with "php"
-    m_num = re.match(r"^([\d\.]+)\s*(?:php)?$", token, re.I)
+    m_num = RE_PHP_NUM.match(token)
     if m_num:
         try:
             php_val = float(m_num.group(1))
@@ -133,7 +139,7 @@ def process_query(text):
         return []
 
     if "," in text or ";" in text:
-        raw_parts = re.split(r"[,;]+", text)
+        raw_parts = RE_SPLIT_TOKENS.split(text)
         results = []
         for part in raw_parts:
             part = part.strip()
@@ -153,8 +159,7 @@ def process_query(text):
 def extract_numbers_from_clipboard(text):
     if not text:
         return ""
-    # Way 3: Matches any sequence of digits (including decimals) anywhere in the text
-    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+    numbers = RE_NUMBERS.findall(text)
     if not numbers:
         return ""
     return ", ".join(numbers)
@@ -198,8 +203,6 @@ class ScreenSnipper:
         self.canvas = tk.Canvas(self.root, cursor="cross", bg="#000000", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
-        self.start_x = None
-        self.start_y = None
         self.rect = None
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
@@ -273,6 +276,7 @@ class FloatingCalcOverlay:
 
         # Compact widget dimensions: reduced default width by 35% (very small & compact)
         self._resize_job = None
+        self._note_save_job = None
 
         self.opacity = 1.0  # Range from 0.0 (100% transparent background) to 1.0 (pure solid black background)
 
@@ -663,7 +667,15 @@ class FloatingCalcOverlay:
             pass
 
     def _on_note_change(self, event=None):
-        """Auto-saves notes to notes.txt on keystroke."""
+        """Debounced auto-save of notes to disk to prevent UI lag on rapid typing."""
+        if self._note_save_job is not None:
+            self.root.after_cancel(self._note_save_job)
+        self._note_save_job = self.root.after(400, self._save_notes_to_file)
+
+    def _save_notes_to_file(self):
+        self._note_save_job = None
+        if self._is_destroyed:
+            return
         try:
             content = self.notepad_text.get("1.0", tk.END)
             with open(NOTES_FILE, "w", encoding="utf-8") as f:
@@ -984,16 +996,51 @@ class FloatingCalcOverlay:
         except Exception:
             pass
 
+    def _force_windows_foreground(self):
+        """Forces the Tkinter window to become the active foreground window in Windows OS."""
+        try:
+            hwnd = self.root.winfo_id()
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            # Use AttachThreadInput to bypass Windows foreground lock restrictions
+            fore_hwnd = user32.GetForegroundWindow()
+            fore_thread = user32.GetWindowThreadProcessId(fore_hwnd, None)
+            cur_thread = kernel32.GetCurrentThreadId()
+
+            if fore_thread != cur_thread:
+                user32.AttachThreadInput(cur_thread, fore_thread, True)
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                user32.AttachThreadInput(cur_thread, fore_thread, False)
+            else:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
     def focus_input(self, event=None):
         try:
             if self.is_minimized:
                 self.restore_from_bubble()
+                return
+
             self.root.deiconify()
             self.root.lift()
             self.root.attributes("-topmost", True)
-            self.entry.focus_force()
-            self.entry.selection_range(0, tk.END)
-            self.entry.icursor(tk.END)
+            self._force_windows_foreground()
+
+            def _apply_focus():
+                if self._is_destroyed:
+                    return
+                self.entry.focus_force()
+                self.entry.selection_range(0, tk.END)
+                self.entry.icursor(tk.END)
+
+            _apply_focus()
+            # Double check with a tiny delay to ensure OS finishes processing the Alt+Space release
+            self.root.after(30, _apply_focus)
+            self.root.after(80, _apply_focus)
             self.reset_inactivity_timer()
         except Exception:
             pass
@@ -1033,6 +1080,20 @@ class FloatingCalcOverlay:
             except Exception:
                 pass
             self._inactivity_timer_id = None
+
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:
+                pass
+            self._resize_job = None
+
+        if self._note_save_job is not None:
+            try:
+                self.root.after_cancel(self._note_save_job)
+            except Exception:
+                pass
+            self._save_notes_to_file()
 
         # Persist position to disk so it re-opens in the exact same location
         self._save_window_config()
@@ -1320,9 +1381,8 @@ class FloatingCalcOverlay:
         # Reapply current opacity styling
         self.adjust_opacity(0.0)
 
-        # Focus calculator input
-        self.root.after(50, lambda: self.entry.focus_set())
-        self.reset_inactivity_timer()
+        # Force window foreground and focus input
+        self.focus_input()
 
     def _draw_bubble(self, is_hover=False):
         """
@@ -1339,6 +1399,7 @@ class FloatingCalcOverlay:
         # Edge detection
         is_left_edge = cur_x <= 30
         is_right_edge = cur_x >= (screen_w - 68)
+        self._last_bubble_dock = "left" if is_left_edge else ("right" if is_right_edge else "float")
 
         # Color scheme
         bg_color = "#313244" if is_hover else "#181825"
@@ -1417,7 +1478,13 @@ class FloatingCalcOverlay:
         new_x = self.root.winfo_pointerx() - self._offsetx
         new_y = self.root.winfo_pointery() - self._offsety
         self.root.geometry(f"+{new_x}+{new_y}")
-        self._draw_bubble(is_hover=True)
+
+        # Only redraw if the edge-docking status changes (left edge, right edge, floating)
+        screen_w = self.root.winfo_screenwidth()
+        current_dock = "left" if new_x <= 30 else ("right" if new_x >= (screen_w - 68) else "float")
+        if getattr(self, "_last_bubble_dock", None) != current_dock:
+            self._last_bubble_dock = current_dock
+            self._draw_bubble(is_hover=True)
 
     def _on_bubble_release(self, event):
         if not self._bubble_drag_started:
