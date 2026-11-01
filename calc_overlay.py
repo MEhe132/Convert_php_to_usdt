@@ -331,15 +331,18 @@ class FloatingCalcOverlay:
             start_y = max(0, min(screen_h - 50, saved_cfg["y"]))
             self.fixed_width = max(self.min_width, saved_cfg.get("width", init_w))
             start_h = max(self.min_height, saved_cfg.get("height", init_h))
+            self.user_min_height = start_h
         else:
             self.fixed_width = init_w
             start_x = max(20, screen_w - self.fixed_width - 30)
             start_y = 80
             start_h = init_h
+            self.user_min_height = init_h
 
         self._start_w = self.fixed_width
         self._start_h = start_h
         self.root.geometry(f"{self.fixed_width}x{start_h}+{start_x}+{start_y}")
+        self.root.update_idletasks()
         self._check_notepad_visibility()
 
         # Apply saved opacity setting
@@ -431,6 +434,47 @@ class FloatingCalcOverlay:
         )
         btn_op_minus.pack(side="left", padx=1)
         btn_op_minus.bind("<Button-1>", lambda e: self.adjust_opacity(-0.1))
+
+        # Size increase and decrease buttons in header
+        btn_size_plus = tk.Label(
+            self.header,
+            text="⊞+",
+            bg="#1e1e2e",
+            fg="#a6e3a1",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=3,
+            pady=0
+        )
+        btn_size_plus.pack(side="left", padx=(3, 1))
+        btn_size_plus.bind("<Button-1>", lambda e: self.adjust_window_size(40, 25))
+
+        btn_size_minus = tk.Label(
+            self.header,
+            text="⊟-",
+            bg="#1e1e2e",
+            fg="#f38ba8",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=3,
+            pady=0
+        )
+        btn_size_minus.pack(side="left", padx=1)
+        btn_size_minus.bind("<Button-1>", lambda e: self.adjust_window_size(-40, -25))
+
+        # Notes quick-toggle button in header
+        self.btn_notes_toggle = tk.Label(
+            self.header,
+            text="📝",
+            bg="#1e1e2e",
+            fg="#fab387",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=3,
+            pady=0
+        )
+        self.btn_notes_toggle.pack(side="left", padx=(2, 1))
+        self.btn_notes_toggle.bind("<Button-1>", lambda e: self.toggle_notepad())
 
         # Close button in the far upper-right corner
         close_btn = tk.Label(
@@ -644,14 +688,75 @@ class FloatingCalcOverlay:
     def _check_notepad_visibility(self):
         """Shows notepad only when window width has been expanded beyond default compact calculator width."""
         try:
-            cur_w = self.root.winfo_width()
+            cur_w = max(self.fixed_width, self.root.winfo_width())
             # If width expanded by more than 40px over compact min_width, reveal notepad
             if cur_w > (self.min_width + 40):
                 if not self.notepad_panel.winfo_ismapped():
                     self.notepad_panel.pack(side="left", fill="both", expand=True, padx=(4, 0))
+                if hasattr(self, "btn_notes_toggle"):
+                    self.btn_notes_toggle.config(bg="#313244", fg="#a6e3a1")
             else:
                 if self.notepad_panel.winfo_ismapped():
                     self.notepad_panel.pack_forget()
+                if hasattr(self, "btn_notes_toggle"):
+                    self.btn_notes_toggle.config(bg="#1e1e2e", fg="#fab387")
+        except Exception:
+            pass
+
+    def toggle_notepad(self):
+        """Quick-toggles the Notepad side panel on/off by expanding or collapsing window width."""
+        try:
+            if self.notepad_panel.winfo_ismapped() or self.fixed_width > (self.min_width + 40):
+                # Collapse to compact calculator width
+                self.fixed_width = self.min_width
+                cur_h = max(self.min_height, self.root.winfo_height())
+                cur_x = self.root.winfo_x()
+                cur_y = self.root.winfo_y()
+                self.root.geometry(f"{self.fixed_width}x{cur_h}+{cur_x}+{cur_y}")
+                self._check_notepad_visibility()
+                self.flash_toast("📝 Notes hidden")
+            else:
+                # Expand width to show notepad comfortably
+                self.fixed_width = max(self.min_width + 160, 320)
+                cur_h = max(self.min_height, self.root.winfo_height(), 160)
+                self.user_min_height = max(getattr(self, "user_min_height", self.min_height), cur_h)
+                cur_x = self.root.winfo_x()
+                cur_y = self.root.winfo_y()
+                screen_w = self.root.winfo_screenwidth()
+                if cur_x + self.fixed_width > screen_w:
+                    cur_x = max(0, screen_w - self.fixed_width - 10)
+                self.root.geometry(f"{self.fixed_width}x{cur_h}+{cur_x}+{cur_y}")
+                self._check_notepad_visibility()
+                self.notepad_text.focus_set()
+                self.flash_toast("📝 Notes opened")
+            self._save_window_config()
+        except Exception:
+            pass
+
+    def adjust_window_size(self, dw, dh):
+        """Increases or decreases the window dimensions via the header ⊞+ / ⊟- buttons."""
+        try:
+            cur_w = max(self.min_width, self.fixed_width)
+            cur_h = max(self.min_height, self.root.winfo_height())
+            new_w = max(self.min_width, cur_w + dw)
+            new_h = max(self.min_height, cur_h + dh)
+
+            self.fixed_width = new_w
+            self.user_min_height = new_h
+
+            cur_x = self.root.winfo_x()
+            cur_y = self.root.winfo_y()
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            if cur_x + new_w > screen_w:
+                cur_x = max(0, screen_w - new_w - 10)
+            if cur_y + new_h > screen_h:
+                cur_y = max(0, screen_h - new_h - 10)
+
+            self.root.geometry(f"{new_w}x{new_h}+{cur_x}+{cur_y}")
+            self._check_notepad_visibility()
+            self._save_window_config()
+            self.flash_toast(f"Size: {new_w}×{new_h}")
         except Exception:
             pass
 
@@ -977,13 +1082,14 @@ class FloatingCalcOverlay:
 
     def _do_auto_resize(self):
         self._resize_job = None
-        if self._is_destroyed:
+        if self._is_destroyed or self.is_minimized:
             return
         try:
             self.root.update_idletasks()
             # Do NOT increase width automatically; keep fixed width and only adjust height
             target_w = self.fixed_width
-            needed_h = max(self.min_height, self.root.winfo_reqheight())
+            min_h = max(self.min_height, getattr(self, "user_min_height", self.min_height))
+            needed_h = max(min_h, self.root.winfo_reqheight())
 
             cur_w = self.root.winfo_width()
             cur_h = self.root.winfo_height()
@@ -1058,13 +1164,22 @@ class FloatingCalcOverlay:
     def _save_window_config(self):
         """Saves current window position, width, and opacity to local disk."""
         try:
-            cfg = {
-                "x": self.root.winfo_x(),
-                "y": self.root.winfo_y(),
-                "width": max(self.min_width, self.fixed_width),
-                "height": max(self.min_height, self.root.winfo_height()),
-                "opacity": self.opacity
-            }
+            if self.is_minimized and self._pre_minimize_geometry:
+                cfg = {
+                    "x": self._pre_minimize_geometry.get("x", self.root.winfo_x()),
+                    "y": self._pre_minimize_geometry.get("y", self.root.winfo_y()),
+                    "width": max(self.min_width, self.fixed_width),
+                    "height": max(self.min_height, self._pre_minimize_geometry.get("h", self.min_height)),
+                    "opacity": self.opacity
+                }
+            else:
+                cfg = {
+                    "x": self.root.winfo_x(),
+                    "y": self.root.winfo_y(),
+                    "width": max(self.min_width, self.fixed_width),
+                    "height": max(self.min_height, self.root.winfo_height()),
+                    "opacity": self.opacity
+                }
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
@@ -1213,6 +1328,7 @@ class FloatingCalcOverlay:
         new_w = max(self.min_width, self._start_w + dx)
         new_h = max(self.min_height, self._start_h + dy)
         self.fixed_width = new_w  # Update the width preference to the user's dragged width
+        self.user_min_height = new_h
         cur_x = self.root.winfo_x()
         cur_y = self.root.winfo_y()
         self.root.geometry(f"{new_w}x{new_h}+{cur_x}+{cur_y}")
@@ -1377,6 +1493,7 @@ class FloatingCalcOverlay:
             target_y = max(0, cur_by)
 
         self.root.geometry(f"{w}x{h}+{target_x}+{target_y}")
+        self._check_notepad_visibility()
 
         # Reapply current opacity styling
         self.adjust_opacity(0.0)
