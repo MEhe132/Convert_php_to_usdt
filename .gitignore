@@ -10,3 +10,6 @@ window_config.json
 recovered_*.py
 saved_*.py
 *.lnk
+build/
+dist/
+*.spec

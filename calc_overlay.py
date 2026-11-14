@@ -367,26 +367,12 @@ class FloatingCalcOverlay:
         self.root.bind("<Control-minus>", lambda e: self.adjust_opacity(-0.1))
         self.root.bind("<Control-KP_Subtract>", lambda e: self.adjust_opacity(-0.1))
 
-        # Activity tracking for 5-second auto-minimize timer
-        self.root.bind_all("<Key>", self._on_user_interaction, add="+")
-        self.root.bind_all("<Motion>", self._on_user_interaction, add="+")
-        self.root.bind_all("<Button-1>", self._on_user_interaction, add="+")
-        self.root.bind_all("<Button-2>", self._on_user_interaction, add="+")
-        self.root.bind_all("<Button-3>", self._on_user_interaction, add="+")
-
-        # Track mouse entering/leaving the window
-        self.root.bind("<Enter>", self._on_window_enter)
-        self.root.bind("<Leave>", self._on_window_leave)
-
-        # Global hotkey listener (Ctrl + /, Ctrl + Plus, Ctrl + Minus) in background daemon thread
+        # Global hotkey listener (Ctrl + /, Ctrl + Plus, Ctrl + Minus, Alt + Space) in background daemon thread
         self._hotkey_thread = threading.Thread(target=self._listen_global_hotkey, daemon=True)
         self._hotkey_thread.start()
 
         # Start Tkinter-native clipboard watcher
         self.root.after(500, self._poll_clipboard)
-
-        # Start auto-minimize timer loop
-        self.reset_inactivity_timer()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1147,7 +1133,6 @@ class FloatingCalcOverlay:
             # Double check with a tiny delay to ensure OS finishes processing the Alt+Space release
             self.root.after(30, _apply_focus)
             self.root.after(80, _apply_focus)
-            self.reset_inactivity_timer()
         except Exception:
             pass
 
@@ -1237,18 +1222,10 @@ class FloatingCalcOverlay:
                     if clean_text:
                         extracted = extract_numbers_from_clipboard(clean_text)
                         if extracted:
-                            # Automatically restore and show calculator if currently minimized
-                            if self.is_minimized:
-                                self.restore_from_bubble()
-                            else:
-                                self.root.deiconify()
-                                self.root.lift()
-                                self.root.attributes("-topmost", True)
-
+                            # Catch the number and update conversion in background without auto-opening popup
                             self.entry_var.set(extracted)
                             self.on_input_change()
                             self.flash_toast("📋 Auto-converted from copy!")
-                            self.reset_inactivity_timer()
             except Exception:
                 pass
 
@@ -1334,39 +1311,18 @@ class FloatingCalcOverlay:
         self.root.geometry(f"{new_w}x{new_h}+{cur_x}+{cur_y}")
         self._check_notepad_visibility()
 
-    # --- Auto-Minimize and Floating Chat Head / Pill System ---
+    # --- Chat Head / Pill System (Manual Alt+Space Toggle) ---
     def _on_user_interaction(self, event=None):
-        """Called whenever the user interacts (typing, moving mouse inside, clicking, dragging)."""
-        if not self.is_minimized:
-            self.reset_inactivity_timer()
+        pass
 
     def _on_window_enter(self, event=None):
         self._mouse_inside_window = True
-        if self._inactivity_timer_id is not None:
-            self.root.after_cancel(self._inactivity_timer_id)
-            self._inactivity_timer_id = None
 
     def _on_window_leave(self, event=None):
-        # Check if cursor is truly outside the root window coordinates
-        try:
-            px = self.root.winfo_pointerx()
-            py = self.root.winfo_pointery()
-            rx = self.root.winfo_rootx()
-            ry = self.root.winfo_rooty()
-            rw = self.root.winfo_width()
-            rh = self.root.winfo_height()
-
-            if not (rx <= px <= rx + rw and ry <= py <= ry + rh):
-                self._mouse_inside_window = False
-                if not self.is_minimized:
-                    self.reset_inactivity_timer()
-        except Exception:
-            self._mouse_inside_window = False
-            if not self.is_minimized:
-                self.reset_inactivity_timer()
+        self._mouse_inside_window = False
 
     def reset_inactivity_timer(self):
-        """Resets the 5-second inactivity countdown timer."""
+        """Auto-off/minimize disabled per user preference (manual Alt+Space shortcut is used)."""
         if self._inactivity_timer_id is not None:
             try:
                 self.root.after_cancel(self._inactivity_timer_id)
@@ -1374,32 +1330,9 @@ class FloatingCalcOverlay:
                 pass
             self._inactivity_timer_id = None
 
-        if not self._is_destroyed and not self.is_minimized:
-            # 5000 ms = 5 seconds
-            self._inactivity_timer_id = self.root.after(5000, self._check_auto_minimize)
-
     def _check_auto_minimize(self):
-        self._inactivity_timer_id = None
-        if self._is_destroyed or self.is_minimized:
-            return
-
-        # Double check if mouse pointer is currently inside our window
-        try:
-            px = self.root.winfo_pointerx()
-            py = self.root.winfo_pointery()
-            rx = self.root.winfo_rootx()
-            ry = self.root.winfo_rooty()
-            rw = self.root.winfo_width()
-            rh = self.root.winfo_height()
-
-            if rx <= px <= rx + rw and ry <= py <= ry + rh:
-                # Mouse is still inside window, defer minimize
-                self.reset_inactivity_timer()
-                return
-        except Exception:
-            pass
-
-        self.minimize_to_bubble()
+        """Auto-minimize disabled."""
+        pass
 
     def toggle_open_minimize(self):
         """Alt + Space toggle: opens/restores if minimized, minimizes to edge if open."""

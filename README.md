@@ -11,8 +11,11 @@ A floating, transparent overlay widget built in Python with Tkinter. It was crea
 - ⚡ **Instant PHP ⇄ USDT Calculations**: Real-time evaluation and bidirectional conversions.
 - 🔍 **Google Lens OCR Snipping**: Quick region-snip tool to grab text or prices straight from the screen.
 - ⌨️ **Global Hotkeys**:
-  - `Ctrl + /` to quickly focus / summon.
+  - `Alt + Space` to toggle open / minimize overlay anytime.
+  - `Ctrl + /` to trigger Google Lens sniper.
   - `Ctrl + +` / `Ctrl + -` to adjust window opacity on the fly.
+- 📋 **Silent Clipboard Catching**: Automatically captures numbers from your clipboard in the background without intrusively popping up or interrupting your active workflow.
+- 📌 **Persistent Display**: Stays visible until you choose to collapse it via `Alt + Space` or the minimize button (no premature 5-second auto-close).
 - 💾 **Session Memory**: Preserves window coordinates, sizing, and opacity preference in `window_config.json`.
 - 🎨 **Minimal Dark Mode**: Clean modern aesthetic with zero clutter.
 
