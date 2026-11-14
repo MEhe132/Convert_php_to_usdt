@@ -291,6 +291,8 @@ class FloatingCalcOverlay:
         self._pre_minimize_geometry = None
         self._bubble_drag_started = False
         self._bubble_press_pos = (0, 0)
+        self._prev_active_hwnd = None
+        self._entry_cursor_pos = None
 
         # Color key for true transparency in Windows
         self.transparent_key = "#010101"
@@ -373,6 +375,7 @@ class FloatingCalcOverlay:
 
         # Start Tkinter-native clipboard watcher
         self.root.after(500, self._poll_clipboard)
+        self.root.after(100, self._update_ram_display)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -461,6 +464,23 @@ class FloatingCalcOverlay:
         )
         self.btn_notes_toggle.pack(side="left", padx=(2, 1))
         self.btn_notes_toggle.bind("<Button-1>", lambda e: self.toggle_notepad())
+
+        # Live RAM usage indicator in top bar
+        self.lbl_ram = tk.Label(
+            self.header,
+            text="RAM ..Mb",
+            bg="#11111b",
+            fg="#a6adc8",
+            font=("Segoe UI", 7, "bold"),
+            cursor="hand2",
+            padx=2,
+            pady=0
+        )
+        self.lbl_ram.pack(side="left", padx=(3, 1))
+        self.lbl_ram.bind("<Button-1>", self.click_title)
+        self.lbl_ram.bind("<B1-Motion>", self.drag_title)
+        self.lbl_ram.bind("<Enter>", lambda e: self.lbl_ram.config(fg="#a6e3a1"))
+        self.lbl_ram.bind("<Leave>", lambda e: self.lbl_ram.config(fg="#6c7086"))
 
         # Close button in the far upper-right corner
         close_btn = tk.Label(
@@ -598,7 +618,8 @@ class FloatingCalcOverlay:
         )
         self.entry.pack(fill="x", pady=(1, 3))
         self.entry.focus_set()
-        self.entry.bind("<KeyRelease>", self.on_input_change)
+        self.entry.bind("<KeyRelease>", self._on_entry_key_release)
+        self.entry.bind("<ButtonRelease-1>", self._on_entry_mouse_release)
 
         # Results display area (table view & summary)
         self.results_frame = tk.Frame(self.calc_left_col, bg="#181825")
@@ -642,7 +663,7 @@ class FloatingCalcOverlay:
         # Right Column: Notepad Panel (Hidden by default, packed only when window is dragged wider)
         self.notepad_panel = tk.Frame(self.calc_panel, bg="#1e1e2e", padx=3, pady=2)
 
-        # Notepad header label
+        # Notepad header label & quick emoji insert button
         self.notepad_header = tk.Frame(self.notepad_panel, bg="#1e1e2e")
         self.notepad_header.pack(fill="x", pady=(0, 2))
         self.notepad_lbl = tk.Label(
@@ -654,10 +675,25 @@ class FloatingCalcOverlay:
         )
         self.notepad_lbl.pack(side="left")
 
+        self.btn_emoji = tk.Label(
+            self.notepad_header,
+            text="😊+",
+            font=("Segoe UI", 8),
+            bg="#1e1e2e",
+            fg="#89b4fa",
+            cursor="hand2",
+            padx=2
+        )
+        self.btn_emoji.pack(side="right", padx=1)
+        self.btn_emoji.bind("<Button-1>", lambda e: self._show_emoji_menu(self.btn_emoji))
+        self.btn_emoji.bind("<Enter>", lambda e: self.btn_emoji.config(fg="#00ff88"))
+        self.btn_emoji.bind("<Leave>", lambda e: self.btn_emoji.config(fg="#89b4fa"))
+
         # Notepad Text widget with wrap & auto-save (height=1 so it never inflates window reqheight)
+        # Uses Segoe UI font for native Windows emoji & Unicode rendering
         self.notepad_text = tk.Text(
             self.notepad_panel,
-            font=("Consolas", 9),
+            font=("Segoe UI", 9),
             bg="#181825",
             fg="#cdd6f4",
             insertbackground="#fab387",
@@ -774,6 +810,82 @@ class FloatingCalcOverlay:
         except Exception:
             pass
 
+    def _show_emoji_menu(self, anchor_widget):
+        """Shows a quick popup menu with common emojis to insert into notes."""
+        try:
+            menu = tk.Menu(self.root, tearoff=0, bg="#1e1e2e", fg="#cdd6f4", activebackground="#313244", activeforeground="#89b4fa", font=("Segoe UI", 9))
+            emojis = [
+                ("✅ Done", "✅ "),
+                ("📌 Pin", "📌 "),
+                ("⭐ Star", "⭐ "),
+                ("🚀 Work", "🚀 "),
+                ("🔥 Hot", "🔥 "),
+                ("💡 Idea", "💡 "),
+                ("⚠️ Alert", "⚠️ "),
+                ("₱ Peso", "₱"),
+                ("💲 Dollar", "$"),
+                ("🕒 Time", "🕒 "),
+                ("More: Win + .", None)
+            ]
+            for label, val in emojis:
+                if val:
+                    menu.add_command(label=label, command=lambda v=val: self._insert_emoji(v))
+                else:
+                    menu.add_separator()
+                    menu.add_command(label=label, state="disabled")
+
+            x = anchor_widget.winfo_rootx()
+            y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            pass
+
+    def _insert_emoji(self, emoji_str):
+        """Inserts an emoji at current text insertion point in notepad."""
+        try:
+            self.notepad_text.insert(tk.INSERT, emoji_str)
+            self._on_note_change()
+            self.notepad_text.focus_set()
+        except Exception:
+            pass
+
+    def _get_process_ram_mb(self):
+        """Measures current process Working Set RAM usage in MB using Win32 API."""
+        try:
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ('cb', wintypes.DWORD),
+                    ('PageFaultCount', wintypes.DWORD),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t)
+                ]
+            fn = ctypes.windll.kernel32.K32GetProcessMemoryInfo
+            fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+            fn.restype = wintypes.BOOL
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if fn(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / (1024 * 1024)
+        except Exception:
+            pass
+        return None
+
+    def _update_ram_display(self):
+        """Periodically refreshes the RAM usage counter in the top bar."""
+        if self._is_destroyed:
+            return
+        ram_mb = self._get_process_ram_mb()
+        if ram_mb is not None:
+            self.lbl_ram.config(text=f"RAM {ram_mb:.0f}Mb")
+        if not self._is_destroyed:
+            self.root.after(3000, self._update_ram_display)
+
     def _blend_color(self, hex_fg, hex_bg, factor):
         """Blends a hex color toward background to simulate background opacity."""
         c1 = [int(hex_fg[i:i+2], 16) for i in (1, 3, 5)]
@@ -812,7 +924,11 @@ class FloatingCalcOverlay:
                 self.notepad_panel.configure(bg=bg_entry)
                 self.notepad_header.configure(bg=bg_entry)
                 self.notepad_lbl.configure(bg=bg_entry)
+                if hasattr(self, "btn_emoji"):
+                    self.btn_emoji.configure(bg=bg_entry)
                 self.notepad_text.configure(bg=bg_bar)
+            if hasattr(self, "lbl_ram"):
+                self.lbl_ram.configure(bg=bg_bar)
             self.results_frame.configure(bg=bg_main)
             self.table_header.configure(bg=bg_main)
             self.table_rows_frame.configure(bg=bg_main)
@@ -949,6 +1065,19 @@ class FloatingCalcOverlay:
             return
         self.lbl_toast.config(text=msg)
         self.root.after(3500, lambda: self.lbl_toast.config(text="") if not self._is_destroyed else None)
+
+    def _on_entry_key_release(self, event=None):
+        try:
+            self._entry_cursor_pos = self.entry.index(tk.INSERT)
+        except Exception:
+            pass
+        self.on_input_change(event)
+
+    def _on_entry_mouse_release(self, event=None):
+        try:
+            self._entry_cursor_pos = self.entry.index(tk.INSERT)
+        except Exception:
+            pass
 
     def on_input_change(self, event=None):
         query = self.entry_var.get().strip()
@@ -1089,25 +1218,65 @@ class FloatingCalcOverlay:
             pass
 
     def _force_windows_foreground(self):
-        """Forces the Tkinter window to become the active foreground window in Windows OS."""
+        """Forces the Tkinter window to become the active foreground window in Windows OS using AttachThreadInput."""
         try:
             hwnd = self.root.winfo_id()
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
 
-            # Use AttachThreadInput to bypass Windows foreground lock restrictions
+            # Find top-level OS window ancestor (GA_ROOT = 2)
+            top_hwnd = user32.GetAncestor(hwnd, 2)
+            if not top_hwnd:
+                top_hwnd = hwnd
+
             fore_hwnd = user32.GetForegroundWindow()
             fore_thread = user32.GetWindowThreadProcessId(fore_hwnd, None)
             cur_thread = kernel32.GetCurrentThreadId()
 
-            if fore_thread != cur_thread:
+            if fore_thread and fore_thread != cur_thread:
                 user32.AttachThreadInput(cur_thread, fore_thread, True)
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(top_hwnd)
+                user32.SetForegroundWindow(top_hwnd)
+                user32.SetActiveWindow(top_hwnd)
+                user32.SwitchToThisWindow(top_hwnd, True)
                 user32.AttachThreadInput(cur_thread, fore_thread, False)
             else:
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(top_hwnd)
+                user32.SetForegroundWindow(top_hwnd)
+                user32.SetActiveWindow(top_hwnd)
+                user32.SwitchToThisWindow(top_hwnd, True)
+        except Exception:
+            pass
+
+    def _restore_previous_window_focus(self):
+        """Restores focus and typing cursor back to the user's previous window (text box) like in ai_sidebar."""
+        prev_hwnd = getattr(self, "_prev_active_hwnd", None)
+        if not prev_hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            if not user32.IsWindow(prev_hwnd):
+                return
+
+            top_prev = user32.GetAncestor(prev_hwnd, 2) or prev_hwnd
+            fore_hwnd = user32.GetForegroundWindow()
+            fore_thread = user32.GetWindowThreadProcessId(fore_hwnd, None)
+            target_thread = user32.GetWindowThreadProcessId(top_prev, None)
+            cur_thread = kernel32.GetCurrentThreadId()
+
+            if cur_thread != target_thread:
+                user32.AttachThreadInput(cur_thread, target_thread, True)
+                user32.BringWindowToTop(top_prev)
+                user32.SetForegroundWindow(top_prev)
+                user32.SetActiveWindow(top_prev)
+                user32.SwitchToThisWindow(top_prev, True)
+                user32.AttachThreadInput(cur_thread, target_thread, False)
+            else:
+                user32.BringWindowToTop(top_prev)
+                user32.SetForegroundWindow(top_prev)
+                user32.SetActiveWindow(top_prev)
+                user32.SwitchToThisWindow(top_prev, True)
         except Exception:
             pass
 
@@ -1126,13 +1295,21 @@ class FloatingCalcOverlay:
                 if self._is_destroyed:
                     return
                 self.entry.focus_force()
-                self.entry.selection_range(0, tk.END)
-                self.entry.icursor(tk.END)
+                self.entry.selection_clear()
+                # Restore typing cursor to the previous writing point
+                target_pos = getattr(self, "_entry_cursor_pos", None)
+                if target_pos is None:
+                    target_pos = tk.END
+                try:
+                    self.entry.icursor(target_pos)
+                except Exception:
+                    self.entry.icursor(tk.END)
 
             _apply_focus()
-            # Double check with a tiny delay to ensure OS finishes processing the Alt+Space release
+            # Staggered focus passes like in ai_sidebar to ensure Windows finishes processing the physical Alt+Space release
             self.root.after(30, _apply_focus)
             self.root.after(80, _apply_focus)
+            self.root.after(160, _apply_focus)
         except Exception:
             pass
 
@@ -1256,7 +1433,11 @@ class FloatingCalcOverlay:
                 hid = msg.wParam
                 if hid == HOTKEY_ID_TOGGLE:
                     try:
-                        self.root.after(0, self.toggle_open_minimize)
+                        fore_wnd = user32.GetForegroundWindow()
+                    except Exception:
+                        fore_wnd = None
+                    try:
+                        self.root.after(0, lambda f=fore_wnd: self.toggle_open_minimize(f))
                     except Exception:
                         break
                 elif hid == HOTKEY_ID_LENS:
@@ -1334,17 +1515,31 @@ class FloatingCalcOverlay:
         """Auto-minimize disabled."""
         pass
 
-    def toggle_open_minimize(self):
-        """Alt + Space toggle: opens/restores if minimized, minimizes to edge if open."""
+    def toggle_open_minimize(self, caller_hwnd=None):
+        """Alt + Space toggle: opens/restores if minimized, minimizes to bubble and restores user text box focus if open."""
         if self._is_destroyed:
             return
+
+        user32 = ctypes.windll.user32
+        my_hwnd = None
+        top_my_hwnd = None
+        try:
+            my_hwnd = self.root.winfo_id()
+            top_my_hwnd = user32.GetAncestor(my_hwnd, 2) or my_hwnd
+        except Exception:
+            pass
+
         if self.is_minimized:
+            # Record the window where the user was writing before opening
+            cand_hwnd = caller_hwnd or user32.GetForegroundWindow()
+            if cand_hwnd and cand_hwnd != my_hwnd and cand_hwnd != top_my_hwnd:
+                self._prev_active_hwnd = cand_hwnd
             self.restore_from_bubble()
         else:
             self.minimize_to_bubble()
 
     def minimize_to_bubble(self):
-        """Smoothly collapses the full calculator and auto-snaps to left or right screen edge as a tab/pill."""
+        """Smoothly collapses the calculator into a floating bubble and restores focus to the user's previous window."""
         if self.is_minimized or self._is_destroyed:
             return
 
@@ -1356,6 +1551,12 @@ class FloatingCalcOverlay:
             "h": self.root.winfo_height(),
             "bg": self.root.cget("bg")
         }
+
+        # Save current writing cursor position before minimizing
+        try:
+            self._entry_cursor_pos = self.entry.index(tk.INSERT)
+        except Exception:
+            pass
 
         self.is_minimized = True
         if self._inactivity_timer_id is not None:
@@ -1377,8 +1578,6 @@ class FloatingCalcOverlay:
         cur_y = self._pre_minimize_geometry["y"]
 
         # Auto-snap to nearest edge (left or right side edge)
-        # Closer to left half -> snap to left edge (x = 0) with '>' tab
-        # Closer to right half -> snap to right edge (x = screen_w - 38) with '<' tab
         if (cur_x + 19) < (screen_w // 2):
             bx = 0
         else:
@@ -1389,6 +1588,9 @@ class FloatingCalcOverlay:
 
         self.root.geometry(f"38x38+{bx}+{by}")
         self._draw_bubble(is_hover=False)
+
+        # Restore focus and typing cursor back to the user's previous text box (like in ai_sidebar)
+        self.root.after(30, self._restore_previous_window_focus)
 
     def restore_from_bubble(self):
         """Expands the floating bubble back to the full calculator instantly right at that location."""
@@ -1431,81 +1633,39 @@ class FloatingCalcOverlay:
         # Reapply current opacity styling
         self.adjust_opacity(0.0)
 
-        # Force window foreground and focus input
+        # Force window foreground and restore cursor to previous writing point
         self.focus_input()
 
     def _draw_bubble(self, is_hover=False):
         """
-        Draws the sleek Messenger-style chat head or edge drawer tab:
-        - If against left edge (x <= 40px): displays '>' drawer tab
-        - If against right edge (x >= screen_width - 70px): displays '<' drawer tab
-        - Otherwise (floating anywhere on screen): displays sleek circular chat head with '₱' / '$' or icon
+        Draws the sleek Messenger-style chat head:
+        Always displays the sleek circular chat head with the default '₱' sign (no '<' or '>' signs).
         """
         self.bubble_canvas.delete("all")
-
-        cur_x = self.root.winfo_x()
-        screen_w = self.root.winfo_screenwidth()
-
-        # Edge detection
-        is_left_edge = cur_x <= 30
-        is_right_edge = cur_x >= (screen_w - 68)
-        self._last_bubble_dock = "left" if is_left_edge else ("right" if is_right_edge else "float")
 
         # Color scheme
         bg_color = "#313244" if is_hover else "#181825"
         border_color = "#89b4fa" if is_hover else "#cdd6f4"
-        text_color = "#00ff88" if is_hover else "#89b4fa"
 
-        if is_left_edge:
-            # Left edge pill tab: show '>'
-            symbol = ">"
-            self.bubble_canvas.create_oval(
-                -10, 2, 34, 36,
-                fill=bg_color,
-                outline=border_color,
-                width=2
-            )
-            self.bubble_canvas.create_text(
-                17, 19,
-                text=symbol,
-                fill=text_color,
-                font=("Segoe UI", 12, "bold")
-            )
-        elif is_right_edge:
-            # Right edge pill tab: show '<'
-            symbol = "<"
-            self.bubble_canvas.create_oval(
-                4, 2, 48, 36,
-                fill=bg_color,
-                outline=border_color,
-                width=2
-            )
-            self.bubble_canvas.create_text(
-                21, 19,
-                text=symbol,
-                fill=text_color,
-                font=("Segoe UI", 12, "bold")
-            )
-        else:
-            # Floating Chat Head Circle (38x38)
-            self.bubble_canvas.create_oval(
-                2, 2, 36, 36,
-                fill=bg_color,
-                outline=border_color,
-                width=2
-            )
-            # Inner accent ring
-            self.bubble_canvas.create_oval(
-                5, 5, 33, 33,
-                outline="#45475a",
-                width=1
-            )
-            self.bubble_canvas.create_text(
-                19, 19,
-                text="₱",
-                fill="#ff5555" if not is_hover else "#00ff88",
-                font=("Segoe UI", 12, "bold")
-            )
+        # Floating Chat Head Circle (38x38)
+        self.bubble_canvas.create_oval(
+            2, 2, 36, 36,
+            fill=bg_color,
+            outline=border_color,
+            width=2
+        )
+        # Inner accent ring
+        self.bubble_canvas.create_oval(
+            5, 5, 33, 33,
+            outline="#45475a",
+            width=1
+        )
+        self.bubble_canvas.create_text(
+            19, 19,
+            text="₱",
+            fill="#ff5555" if not is_hover else "#00ff88",
+            font=("Segoe UI", 12, "bold")
+        )
 
     def _on_bubble_enter(self, event):
         self._draw_bubble(is_hover=True)
@@ -1528,13 +1688,6 @@ class FloatingCalcOverlay:
         new_x = self.root.winfo_pointerx() - self._offsetx
         new_y = self.root.winfo_pointery() - self._offsety
         self.root.geometry(f"+{new_x}+{new_y}")
-
-        # Only redraw if the edge-docking status changes (left edge, right edge, floating)
-        screen_w = self.root.winfo_screenwidth()
-        current_dock = "left" if new_x <= 30 else ("right" if new_x >= (screen_w - 68) else "float")
-        if getattr(self, "_last_bubble_dock", None) != current_dock:
-            self._last_bubble_dock = current_dock
-            self._draw_bubble(is_hover=True)
 
     def _on_bubble_release(self, event):
         if not self._bubble_drag_started:

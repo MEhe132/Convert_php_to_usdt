@@ -86,6 +86,13 @@ class TestCalcConverter(unittest.TestCase):
         self.assertEqual(extract_numbers_from_clipboard(""), "")
         self.assertEqual(extract_numbers_from_clipboard("no numbers here"), "")
 
+    def test_get_process_ram_mb(self):
+        from calc_overlay import FloatingCalcOverlay
+        ram = FloatingCalcOverlay._get_process_ram_mb(None)
+        if ram is not None:
+            self.assertGreater(ram, 0.0)
+            self.assertLess(ram, 1000.0)  # Should reasonably be well under 1GB
+
 
 if __name__ == "__main__":
     unittest.main()
