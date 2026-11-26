@@ -610,13 +610,14 @@ class FloatingCalcOverlay:
         self.lbl_toast.pack(side="left", padx=2)
 
         # Prominent resize grip with hover feedback in bottom right
+        resize_cursor = "size_nw_se" if IS_WINDOWS else "bottom_right_corner"
         self.grip = tk.Label(
             self.bottom_bar,
             text=" ⇲ ",
             font=("Segoe UI", 9, "bold"),
             bg="#11111b",
             fg="#ff5555",
-            cursor="size_nw_se",
+            cursor=resize_cursor,
             padx=4
         )
         self.grip.pack(side="right")
