@@ -9,7 +9,10 @@ import tempfile
 import base64
 import subprocess
 import json
+import socket
 from PIL import Image, ImageGrab
+
+IPC_SOCKET_PATH = os.path.join(tempfile.gettempdir(), f"calc_php_converter_{os.getuid()}.sock")
 
 # Platform detection
 IS_WINDOWS = sys.platform.startswith("win")
@@ -404,6 +407,11 @@ class FloatingCalcOverlay:
         # Global hotkey listener (Ctrl + /, Ctrl + Plus, Ctrl + Minus, Alt + Space) in background daemon thread
         self._hotkey_thread = threading.Thread(target=self._listen_global_hotkey, daemon=True)
         self._hotkey_thread.start()
+
+        # Unix IPC Server for global Hyprland shortcuts (toggle, lens, etc.)
+        self._ipc_server = None
+        if not IS_WINDOWS:
+            self._start_ipc_server()
 
         # Start Tkinter-native clipboard watcher
         self.root.after(500, self._poll_clipboard)
@@ -1449,6 +1457,17 @@ class FloatingCalcOverlay:
         # Persist position to disk so it re-opens in the exact same location
         self._save_window_config()
 
+        if getattr(self, "_ipc_server", None):
+            try:
+                self._ipc_server.close()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(IPC_SOCKET_PATH):
+                    os.unlink(IPC_SOCKET_PATH)
+            except Exception:
+                pass
+
         if IS_WINDOWS and ctypes:
             try:
                 user32 = ctypes.windll.user32
@@ -1486,6 +1505,43 @@ class FloatingCalcOverlay:
 
         if not self._is_destroyed:
             self.root.after(400, self._poll_clipboard)
+
+    def _start_ipc_server(self):
+        """Starts a background Unix socket listener so Hyprland shortcuts can control this instance."""
+        def _ipc_worker():
+            try:
+                if os.path.exists(IPC_SOCKET_PATH):
+                    try:
+                        # Check if another instance is already running
+                        test_s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        test_s.connect(IPC_SOCKET_PATH)
+                        test_s.close()
+                        return  # Another instance is actively listening
+                    except Exception:
+                        os.unlink(IPC_SOCKET_PATH)
+
+                self._ipc_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._ipc_server.bind(IPC_SOCKET_PATH)
+                self._ipc_server.listen(5)
+                while not self._is_destroyed:
+                    try:
+                        conn, _ = self._ipc_server.accept()
+                        data = conn.recv(1024).decode("utf-8").strip()
+                        conn.close()
+                        if data == "toggle":
+                            self.root.after(0, self.toggle_open_minimize)
+                        elif data == "lens":
+                            self.root.after(0, self.start_lens_sniper)
+                        elif data == "show":
+                            self.root.after(0, self.restore_from_bubble)
+                        elif data == "hide":
+                            self.root.after(0, self.minimize_to_bubble)
+                    except Exception:
+                        break
+            except Exception as e:
+                print("IPC server error:", e)
+
+        threading.Thread(target=_ipc_worker, daemon=True).start()
 
     def _listen_global_hotkey(self):
         if not IS_WINDOWS or not ctypes or not wintypes:
@@ -1788,7 +1844,36 @@ class FloatingCalcOverlay:
 
 
 
+def send_ipc_command(cmd):
+    """Sends command to running instance via Unix domain socket. Returns True if handled."""
+    if IS_WINDOWS or not os.path.exists(IPC_SOCKET_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(IPC_SOCKET_PATH)
+        s.sendall(cmd.encode("utf-8"))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    app_root = tk.Tk()
+    # Check CLI arguments for global Hyprland control
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower().strip("--")
+        if arg in ("toggle", "lens", "show", "hide"):
+            if send_ipc_command(arg):
+                sys.exit(0)
+            # If not running and user called toggle, proceed to launch
+            if arg not in ("toggle", "show"):
+                sys.exit(0)
+
+    # If instance already running and launched without args, toggle it instead of opening duplicate
+    if send_ipc_command("toggle"):
+        sys.exit(0)
+
+    app_root = tk.Tk(className="php_converter")
     app = FloatingCalcOverlay(app_root)
     app_root.mainloop()
