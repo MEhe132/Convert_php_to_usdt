@@ -1025,7 +1025,30 @@ class FloatingCalcOverlay:
 
     # --- Google Lens Screen Sniper Workflow ---
     def start_lens_sniper(self):
-        """Hides overlay and launches full-screen snippet capture tool."""
+        """Hides overlay and launches snippet capture tool."""
+        if not IS_WINDOWS:
+            # On Linux/Wayland: Use native slurp + grim directly.
+            # This avoids the black fullscreen canvas and lets you select directly over your desktop!
+            def _wayland_capture_worker():
+                try:
+                    # Run slurp to let user select region directly on their screen
+                    slurp_p = subprocess.run(["slurp", "-d"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    geometry = slurp_p.stdout.strip()
+                    if not geometry:
+                        # User cancelled (e.g. pressed Escape or clicked outside)
+                        return
+                    # Capture exact geometry with grim
+                    grim_p = subprocess.run(["grim", "-g", geometry, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if grim_p.stdout:
+                        captured_img = Image.open(io.BytesIO(grim_p.stdout))
+                        self.root.after(0, lambda: self.handle_screen_snippet(captured_img))
+                except Exception as e:
+                    print("Wayland capture error:", e)
+
+            threading.Thread(target=_wayland_capture_worker, daemon=True).start()
+            return
+
+        # Windows fallback: uses transparent fullscreen Tkinter Toplevel snipper
         self.root.withdraw()
         self.root.after(100, lambda: ScreenSnipper(
             on_snippet_taken=self.handle_screen_snippet,
