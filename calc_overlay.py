@@ -1319,6 +1319,27 @@ class FloatingCalcOverlay:
         except Exception:
             pass
 
+        # Linux / Hyprland Wayland Compositor Focus
+        if not IS_WINDOWS:
+            try:
+                # Find this window's address in Hyprland and focus it directly
+                p = subprocess.run(["hyprctl", "-j", "clients"], capture_output=True, text=True, timeout=1)
+                if p.stdout:
+                    clients = json.loads(p.stdout)
+                    my_pid = os.getpid()
+                    for c in clients:
+                        if c.get("pid") == my_pid:
+                            addr = c.get("address")
+                            if addr:
+                                subprocess.run([
+                                    "hyprctl", "eval",
+                                    f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))'
+                                ], capture_output=True, timeout=1)
+                                break
+            except Exception:
+                pass
+            return
+
         if not IS_WINDOWS or not ctypes:
             return
 
