@@ -391,6 +391,8 @@ class FloatingCalcOverlay:
         self.root.bind("<Alt-period>", lambda e: self.start_lens_sniper())
         self.root.bind("<Alt-greater>", lambda e: self.start_lens_sniper())
         self.root.bind("<Alt-space>", lambda e: self.toggle_open_minimize())
+        self.root.bind("<Alt-c>", lambda e: self.toggle_open_minimize())
+        self.root.bind("<Alt-C>", lambda e: self.toggle_open_minimize())
 
         # Shortcuts for Opacity: Ctrl + and Ctrl - (supporting main keyboard, numpad, and Shift)
         self.root.bind("<Control-plus>", lambda e: self.adjust_opacity(0.1))
@@ -653,6 +655,8 @@ class FloatingCalcOverlay:
         self.entry.bind("<ButtonRelease-1>", self._on_entry_mouse_release)
         self.entry.bind("<Alt-period>", lambda e: (self.start_lens_sniper(), "break")[1])
         self.entry.bind("<Alt-greater>", lambda e: (self.start_lens_sniper(), "break")[1])
+        self.entry.bind("<Alt-c>", lambda e: (self.toggle_open_minimize(), "break")[1])
+        self.entry.bind("<Alt-C>", lambda e: (self.toggle_open_minimize(), "break")[1])
 
         # Results display area (table view & summary)
         self.results_frame = tk.Frame(self.calc_left_col, bg="#181825")
@@ -740,6 +744,8 @@ class FloatingCalcOverlay:
         self.notepad_text.bind("<KeyRelease>", self._on_note_change)
         self.notepad_text.bind("<Alt-period>", lambda e: (self.start_lens_sniper(), "break")[1])
         self.notepad_text.bind("<Alt-greater>", lambda e: (self.start_lens_sniper(), "break")[1])
+        self.notepad_text.bind("<Alt-c>", lambda e: (self.toggle_open_minimize(), "break")[1])
+        self.notepad_text.bind("<Alt-C>", lambda e: (self.toggle_open_minimize(), "break")[1])
         self._load_notes()
 
     def _check_notepad_visibility(self):
