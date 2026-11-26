@@ -1,8 +1,7 @@
 import tkinter as tk
 import re
 import threading
-import ctypes
-from ctypes import wintypes
+import sys
 import webbrowser
 import io
 import os
@@ -10,7 +9,29 @@ import tempfile
 import base64
 import subprocess
 import json
-from PIL import ImageGrab
+from PIL import Image, ImageGrab
+
+# Platform detection
+IS_WINDOWS = sys.platform.startswith("win")
+
+if IS_WINDOWS:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # Enable DPI Awareness so screen coordinates match physical pixels perfectly (fixes 125%/150% scaling offset bug)
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    except Exception:
+        ctypes = None
+        wintypes = None
+else:
+    ctypes = None
+    wintypes = None
 
 # Configuration file to remember screen position, size, and opacity
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_config.json")
@@ -26,7 +47,7 @@ RE_CLEAN_MATH = re.compile(r"[^0-9\+\-\*\/\.\(\)\%\s]")
 RE_SPLIT_TOKENS = re.compile(r"[,;]+")
 RE_NUMBERS = re.compile(r"\d+(?:\.\d+)?")
 
-# Windows Hotkey constants
+# Windows Hotkey constants (for fallback on Windows)
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_NOREPEAT = 0x4000
@@ -43,15 +64,6 @@ HOTKEY_ID_OP_PLUS1 = 102
 HOTKEY_ID_OP_PLUS2 = 103
 HOTKEY_ID_OP_MINUS1 = 104
 HOTKEY_ID_OP_MINUS2 = 105
-
-# Enable DPI Awareness so screen coordinates match physical pixels perfectly (fixes 125%/150% scaling offset bug)
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
 
 
 def eval_math(expr):
@@ -245,14 +257,30 @@ class ScreenSnipper:
         self.root.update()
 
         if (x2 - x1) > 5 and (y2 - y1) > 5:
-            try:
-                # Capture exact bounding box using physical screen coordinates
-                captured_img = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+            # 1. Try Wayland native grim + slurp capture if available
+            captured_img = None
+            if not IS_WINDOWS:
+                try:
+                    w = x2 - x1
+                    h = y2 - y1
+                    geom_str = f"{x1},{y1} {w}x{h}"
+                    p = subprocess.run(["grim", "-g", geom_str, "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+                    if p.stdout:
+                        captured_img = Image.open(io.BytesIO(p.stdout))
+                except Exception:
+                    captured_img = None
+
+            # 2. Fallback to ImageGrab (Windows / X11)
+            if captured_img is None:
+                try:
+                    captured_img = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+                except Exception as e:
+                    print("Grab error:", e)
+
+            if captured_img:
                 self.close_snipper()
                 self.on_snippet_taken(captured_img)
                 return
-            except Exception as e:
-                print("Grab error:", e)
 
         self.close_snipper()
 
@@ -360,6 +388,8 @@ class FloatingCalcOverlay:
         # Local window hotkeys
         self.root.bind("<Escape>", lambda e: self.on_close())
         self.root.bind("<Control-slash>", lambda e: self.start_lens_sniper())
+        self.root.bind("<Alt-period>", lambda e: self.start_lens_sniper())
+        self.root.bind("<Alt-greater>", lambda e: self.start_lens_sniper())
         self.root.bind("<Alt-space>", lambda e: self.toggle_open_minimize())
 
         # Shortcuts for Opacity: Ctrl + and Ctrl - (supporting main keyboard, numpad, and Shift)
@@ -542,7 +572,7 @@ class FloatingCalcOverlay:
 
         self.btn_lens = tk.Label(
             self.lens_frame,
-            text="🔍Lens",
+            text="🔍Lens(Alt+.)",
             bg="#181825",
             fg="#ffff00",  # Bright yellow text
             font=("Segoe UI", 8, "bold"),
@@ -620,6 +650,8 @@ class FloatingCalcOverlay:
         self.entry.focus_set()
         self.entry.bind("<KeyRelease>", self._on_entry_key_release)
         self.entry.bind("<ButtonRelease-1>", self._on_entry_mouse_release)
+        self.entry.bind("<Alt-period>", lambda e: (self.start_lens_sniper(), "break")[1])
+        self.entry.bind("<Alt-greater>", lambda e: (self.start_lens_sniper(), "break")[1])
 
         # Results display area (table view & summary)
         self.results_frame = tk.Frame(self.calc_left_col, bg="#181825")
@@ -705,6 +737,8 @@ class FloatingCalcOverlay:
         )
         self.notepad_text.pack(fill="both", expand=True)
         self.notepad_text.bind("<KeyRelease>", self._on_note_change)
+        self.notepad_text.bind("<Alt-period>", lambda e: (self.start_lens_sniper(), "break")[1])
+        self.notepad_text.bind("<Alt-greater>", lambda e: (self.start_lens_sniper(), "break")[1])
         self._load_notes()
 
     def _check_notepad_visibility(self):
@@ -850,8 +884,30 @@ class FloatingCalcOverlay:
             pass
 
     def _get_process_ram_mb(self):
-        """Measures current process Working Set RAM usage in MB using Win32 API."""
+        """Measures current process Working Set RAM usage in MB cross-platform."""
+        # 1. Linux / procfs fallback
+        if not IS_WINDOWS:
+            try:
+                with open(f"/proc/{os.getpid()}/status", "r") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                return float(parts[1]) / 1024.0
+            except Exception:
+                pass
+            try:
+                import resource
+                # ru_maxrss is in KiB on Linux
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            except Exception:
+                pass
+            return None
+
+        # 2. Windows Win32 API
         try:
+            if not ctypes or not wintypes:
+                return None
             class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
                 _fields_ = [
                     ('cb', wintypes.DWORD),
@@ -1218,7 +1274,16 @@ class FloatingCalcOverlay:
             pass
 
     def _force_windows_foreground(self):
-        """Forces the Tkinter window to become the active foreground window in Windows OS using AttachThreadInput."""
+        """Forces the Tkinter window to become active foreground window cross-platform."""
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        if not IS_WINDOWS or not ctypes:
+            return
+
         try:
             hwnd = self.root.winfo_id()
             user32 = ctypes.windll.user32
@@ -1249,7 +1314,9 @@ class FloatingCalcOverlay:
             pass
 
     def _restore_previous_window_focus(self):
-        """Restores focus and typing cursor back to the user's previous window (text box) like in ai_sidebar."""
+        """Restores focus and typing cursor back to user's previous window."""
+        if not IS_WINDOWS or not ctypes:
+            return
         prev_hwnd = getattr(self, "_prev_active_hwnd", None)
         if not prev_hwnd:
             return
@@ -1375,10 +1442,14 @@ class FloatingCalcOverlay:
         # Persist position to disk so it re-opens in the exact same location
         self._save_window_config()
 
-        user32 = ctypes.windll.user32
-        for hid in [HOTKEY_ID_TOGGLE, HOTKEY_ID_LENS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
+        if IS_WINDOWS and ctypes:
             try:
-                user32.UnregisterHotKey(None, hid)
+                user32 = ctypes.windll.user32
+                for hid in [HOTKEY_ID_TOGGLE, HOTKEY_ID_LENS, HOTKEY_ID_OP_PLUS1, HOTKEY_ID_OP_PLUS2, HOTKEY_ID_OP_MINUS1, HOTKEY_ID_OP_MINUS2]:
+                    try:
+                        user32.UnregisterHotKey(None, hid)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         try:
@@ -1410,7 +1481,13 @@ class FloatingCalcOverlay:
             self.root.after(400, self._poll_clipboard)
 
     def _listen_global_hotkey(self):
-        user32 = ctypes.windll.user32
+        if not IS_WINDOWS or not ctypes or not wintypes:
+            return
+
+        try:
+            user32 = ctypes.windll.user32
+        except Exception:
+            return
 
         def safe_reg(hid, mod, vk):
             if not user32.RegisterHotKey(None, hid, mod | MOD_NOREPEAT, vk):
@@ -1520,20 +1597,26 @@ class FloatingCalcOverlay:
         if self._is_destroyed:
             return
 
-        user32 = ctypes.windll.user32
         my_hwnd = None
         top_my_hwnd = None
-        try:
-            my_hwnd = self.root.winfo_id()
-            top_my_hwnd = user32.GetAncestor(my_hwnd, 2) or my_hwnd
-        except Exception:
-            pass
+        if IS_WINDOWS and ctypes:
+            try:
+                user32 = ctypes.windll.user32
+                my_hwnd = self.root.winfo_id()
+                top_my_hwnd = user32.GetAncestor(my_hwnd, 2) or my_hwnd
+            except Exception:
+                pass
 
         if self.is_minimized:
             # Record the window where the user was writing before opening
-            cand_hwnd = caller_hwnd or user32.GetForegroundWindow()
-            if cand_hwnd and cand_hwnd != my_hwnd and cand_hwnd != top_my_hwnd:
-                self._prev_active_hwnd = cand_hwnd
+            if IS_WINDOWS and ctypes:
+                try:
+                    user32 = ctypes.windll.user32
+                    cand_hwnd = caller_hwnd or user32.GetForegroundWindow()
+                    if cand_hwnd and cand_hwnd != my_hwnd and cand_hwnd != top_my_hwnd:
+                        self._prev_active_hwnd = cand_hwnd
+                except Exception:
+                    pass
             self.restore_from_bubble()
         else:
             self.minimize_to_bubble()
